@@ -109,13 +109,12 @@ def parse_kernel_name(kernel_name: str):
 
 def max_lds_bytes_for_tune() -> int:
     """Addressable LDS limit for the current target."""
-    from aiter.ops.flydsl.utils import get_shared_memory_per_block
+    from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
     try:
-        from aiter.jit.utils.chip_info import get_gfx
+        return get_lds_capacity_bytes()
     except Exception:  # pragma: no cover - chip_info needs a live runtime
-        return get_shared_memory_per_block()
-    return get_shared_memory_per_block(fallback_gfx=get_gfx())
+        return 65536
 
 
 def estimated_lds_bytes(
