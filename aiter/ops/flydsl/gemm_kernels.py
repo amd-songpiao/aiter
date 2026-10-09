@@ -530,15 +530,16 @@ def default_use_cshuffle_epilog(m: int, n: int, k: int) -> bool:
     """gfx950: stage the output through LDS for wide stores when the epilogue
     dominates, i.e. short K with an output large against it.
 
-    Fitted on 14 shapes at K <= 768: on when K <= 512 and M*N >= 32768*K
-    (20480x7168x256 1.14x, 8192x4096x384 1.07x), off below that, where the
-    extra LDS round trip costs more than the wider stores save (8192x1024x512
-    0.97x, 128x7168x256 0.97x). Deeper K is neutral to a loss on every shape
-    measured. gfx942 is unmeasured and keeps the direct epilogue.
+    Fitted on 30 shapes: on when K <= 768 and M*N >= 32768*K (20480x7168x256
+    1.14x, 8192x4096x384 1.07x, 20480x7168x768 1.05x, 32768x5120x768 1.05x),
+    off for smaller outputs, where the extra LDS round trip costs more than the
+    wider stores save (8192x1024x512 0.97x, 8192x1024x768 0.97x). From K=1024
+    up it loses on every large-output shape measured (0.975-0.99x). gfx942 is
+    unmeasured and keeps the direct epilogue.
     """
     if not get_gfx().startswith("gfx95"):
         return False
-    return k <= 512 and m * n >= 32768 * k
+    return k <= 768 and m * n >= 32768 * k
 
 
 @functools.lru_cache(maxsize=1024)
