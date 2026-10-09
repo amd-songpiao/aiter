@@ -159,6 +159,13 @@ def compile_blockscale_preshuffle_gemm_layout(
     use_cshuffle_epilog: bool = False,
     use_xcd_swizzle: bool = False,
     wave_m: int = 1,
+    use_mfma_scale_128: bool | None = None,
+    prefetch_scales: bool = True,
+    direct_mfma: bool | None = None,
+    k128_split_perm: bool = True,
+    full_unroll: bool = False,
+    scalar_b_scale: bool = True,
+    stage_a_scales: bool = False,
 ):
     """Compile the layout-API blockscale preshuffle GEMM. FP8 input, per-[1,128,128]
     block scale, bf16/fp16 output.
@@ -203,6 +210,12 @@ def compile_blockscale_preshuffle_gemm_layout(
     without falling off gfx942's 256-register 2-waves/SIMD cliff, so the
     caller-side heuristic enables it for those alone -- see
     gemm_kernels._blockscale_layout_swizzle_cfg.
+
+    use_mfma_scale_128 (default: on for gfx95x) issues CDNA4's
+    mfma_scale_f32_16x16x128_f8f6f4 with unit scales instead of pairs of
+    16x16x32 fp8 MFMAs. The legacy instruction runs at half of gfx950's fp8
+    rate, so leaving it on there caps the kernel at roughly half the
+    hand-rolled kernel's throughput on deep K.
     """
     if tile_k != SCALE_BLOCK or scale_block_k != SCALE_BLOCK:
         raise ValueError(
@@ -243,12 +256,53 @@ def compile_blockscale_preshuffle_gemm_layout(
             f"tile_m ({tile_m}) must split into whole 16-high MFMA tiles across "
             f"{wave_m} m-waves"
         )
+    # The uniform B-scale address needs each n-wave's 16-column stripe to stay
+    # inside one 128-wide scale block, and a sub-128 tile not to straddle two.
+    if scalar_b_scale and (128 % (wave_n * 16) or (tile_n < 128 and 128 % tile_n)):
+        scalar_b_scale = False
+    # Column assignment per lane for accumulator slot `ni` is
+    # (ni * wave_n + n_wave) * 16 + lane_mod_16 -- the TiledMma wave layout
+    # interleaves waves across N rather than giving each wave one contiguous
+    # n_per_wave block, and the same interleaving applies down M once wave_m > 1.
+    # With scalar_b_scale every column a wave owns for slot ni sits in the
+    # 128-wide block (by_n + ni * wave_n * 16) // 128, so the B-scale is
+    # wave-uniform: one SMEM load per distinct block, landing in an SGPR. (The
+    # rejected readfirstlane variant still issued the per-lane VMEM load first
+    # and then paid a cross-lane move on top.) sb_distinct lists the loads one
+    # tile issues and sb_index maps each slot ni to one of them.
+    _n_acc = (tile_n // wave_n) // 16
+    if scalar_b_scale:
+        _blk_of = [(ni * wave_n * 16) // 128 for ni in range(_n_acc)]
+        sb_distinct = sorted(set(_blk_of))
+        sb_index = [sb_distinct.index(b) for b in _blk_of]
+    else:
+        sb_distinct = list(range(_n_acc))
+        sb_index = list(range(_n_acc))
+
+    if stage_a_scales and not prefetch_scales:
+        raise ValueError("stage_a_scales rides the prefetch_scales pipeline")
+    # A-scales staged in LDS: one 4-byte-per-lane DMA covers 64 rows, so a
+    # stage is padded to 64 floats (the DMA always writes a whole wave's worth).
+    sa_stage_elems = max(tile_m, 64)
+    sa_dma_per_tile = (tile_m + 63) // 64
+    # VMEM loads one tile's scales cost; SMEM B-scale loads are not counted.
+    num_scale_vmem = (1 if stage_a_scales else tile_m // (16 * wave_m)) + (
+        0 if scalar_b_scale else _n_acc
+    )
 
     gpu_arch = get_rocm_arch()
     is_gfx950 = str(gpu_arch).startswith("gfx95")
     if not (is_gfx950 or str(gpu_arch).startswith("gfx942")):
         raise ValueError(f"blockscale preshuffle GEMM needs gfx942/gfx95x, got {gpu_arch}")
     layout_elem = Float8E4M3FN if is_gfx950 else Float8E4M3FNUZ
+    if use_mfma_scale_128 is None:
+        use_mfma_scale_128 = is_gfx950
+    if use_mfma_scale_128 and not is_gfx950:
+        raise ValueError("use_mfma_scale_128 needs gfx95x (CDNA4 scaled MFMA)")
+    if direct_mfma is None:
+        direct_mfma = use_mfma_scale_128
+    if direct_mfma and not use_mfma_scale_128:
+        raise ValueError("direct_mfma needs use_mfma_scale_128 (one MFMA per tile)")
     elem_bytes = 1
     final_out_elem_cls = BFloat16 if out_dtype == "bf16" else Float16
     out_elem_cls = Float32 if split_k > 1 else final_out_elem_cls
@@ -257,8 +311,10 @@ def compile_blockscale_preshuffle_gemm_layout(
     scale_k = K // scale_block_k
     scale_n = (N + 127) // 128  # ScaleBlockN=128, same as gemm_blockscale_preshuffle.py
 
-    tile_K_perm = 64  # fp8 native MFMA grouping (two 32-wide MFMAs per fx.gemm call)
+    # K elements per fx.gemm step: one 16x16x128 scaled MFMA, or two 16x16x32 ones.
+    tile_K_perm = 128 if use_mfma_scale_128 else 64
     k_iters = tile_k // tile_K_perm
+    mfma_per_k_iter = 1 if use_mfma_scale_128 else 2
     num_tiles = split_k_extent // tile_k  # tiles per split
     m_repeat = tile_m // (16 * wave_m)
     n_per_wave = tile_n // wave_n
@@ -294,6 +350,8 @@ def compile_blockscale_preshuffle_gemm_layout(
     # also dead-code-eliminated, which silently shrinks LDS under any write that
     # crosses a field boundary).
     _a_fields = {"a": fx.Array[layout_elem, a_lds_elems * lds_stages, 16]}
+    if stage_a_scales:
+        _a_fields["sa"] = fx.Array[Float32, sa_stage_elems * lds_stages, 16]
     if split_k > 1:
         _a_fields["split_flag"] = fx.Array[Int32, 1, 4]
     SharedStorage = fx.struct(
@@ -341,11 +399,31 @@ def compile_blockscale_preshuffle_gemm_layout(
         arg_scale_b: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
-        tiled_mma: fx.TiledMma,
+        tiled_mma_arg: fx.TiledMma,
         tiled_copy_g2s: fx.TiledCopy,
     ):
         tid = fx.thread_idx.x
         bid_x, bid_y, bid_z = fx.block_idx
+        if const_expr(use_mfma_scale_128):
+            # Built here rather than passed in, as preshuffle_gemm.py does: the
+            # scaled atom is not accepted as a launch argument.
+            # A lane group g takes K bytes [16g, 16g+16) and [64+16g, 64+16g+16)
+            # -- the hand-rolled kernel's split -- not preshuffle_gemm.py's
+            # contiguous [32g, 32g+32). Both are valid (A and B permute alike),
+            # but the contiguous one makes the A ds_reads collide under the
+            # 16-byte row swizzle: 4.2M bank-conflict cycles at 64x128 vs 0.
+            k_perm = (
+                fx.make_layout(((16, 2), 4), ((1, 64), 16))
+                if k128_split_perm
+                else fx.make_layout((32, 4), (1, 32))
+            )
+            tiled_mma = fx.make_tiled_mma(
+                fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, layout_elem)),
+                fx.make_layout((wave_m, wave_n, 1), (wave_n, 1, 0)),
+                fx.make_tile(None, None, k_perm),
+            )
+        else:
+            tiled_mma = tiled_mma_arg
         if const_expr(use_xcd_swizzle):
             # Swizzled launch is 1D in x; recover (m-tile, n-tile) from the linear id.
             rt_m = fx.Index(i32_m)
@@ -474,7 +552,41 @@ def compile_blockscale_preshuffle_gemm_layout(
         # single `mma_atom` plumbed in instead -- not pursued: this kernel is
         # memory-stall-bound, and fully interleaving the FMAs would anyway need
         # a sched_valu primitive FlyDSL does not have.
+        mfma_c_zero = Vec.filled(4, 0.0, Float32)
+
+        def mma_kloop_block_direct(a_stage, cur_frag_B, s_a, s_b):
+            # With the 16x16x128 atom one tile is one MFMA per (mi, ni), so the
+            # per-tile block sum is just that MFMA's result: fold it into the
+            # running accumulator straight away instead of materialising a whole
+            # second accumulator set first. Issued directly rather than through
+            # fx.gemm, which only takes the full m_repeat x n_repeat tiling.
+            fx.copy(
+                uni_copy,
+                pA_s2r_stages[a_stage][None, None, 0],
+                frag_A_retile[None, None, 0],
+            )
+            s_b_vecs = [
+                Vec.filled(4, Float32(s_b[ni]), Float32) for ni in range_constexpr(num_acc_n)
+            ]
+            b_vals = [
+                Vec(cur_frag_B[None, ni, 0].load()).bitcast(Int32)
+                for ni in range_constexpr(num_acc_n)
+            ]
+            for mi in range_constexpr(m_repeat):
+                a_val = Vec(frag_A[None, mi, 0].load()).bitcast(Int32)
+                for ni in range_constexpr(num_acc_n):
+                    blk = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        T.f32x4,
+                        [a_val, b_vals[ni], mfma_c_zero, 0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F],
+                    )
+                    prev = Vec(frag_running[None, mi, ni].load())
+                    fma_result = math_dialect.fma(Vec(blk), s_a[mi] * s_b_vecs[ni], prev)
+                    frag_running[None, mi, ni].store(Vec(fma_result, (4,), Float32))
+
         def mma_kloop_block(a_stage, cur_frag_B, s_a, s_b):
+            if const_expr(direct_mfma):
+                mma_kloop_block_direct(a_stage, cur_frag_B, s_a, s_b)
+                return
             acc_block.store(acc_zero)
             for ki in range_constexpr(k_iters):
                 fx.copy(
@@ -482,11 +594,12 @@ def compile_blockscale_preshuffle_gemm_layout(
                     pA_s2r_stages[a_stage][None, None, ki],
                     frag_A_retile[None, None, ki],
                 )
+                k_coord = ki if use_mfma_scale_128 else (None, ki)
                 fx.gemm(
                     tiled_mma,
                     acc_block,
-                    frag_A[None, None, (None, ki)],
-                    cur_frag_B[None, None, (None, ki)],
+                    frag_A[None, None, k_coord],
+                    cur_frag_B[None, None, k_coord],
                     acc_block,
                 )
             for ni in range_constexpr(num_acc_n):
@@ -560,9 +673,9 @@ def compile_blockscale_preshuffle_gemm_layout(
             # did not even change. Keep the plain per-lane load.
             return buffer_ops.buffer_load(scale_b_rsrc, idx, vec_width=1, dtype=T.f32)
 
-        def load_tile_scales(k_tile):
+        def load_a_scale_vals(k_tile):
             kb = fx.Int32(k_tile)
-            s_a = [
+            return [
                 _read_sa_vec4(
                     kb * fx.Int32(i32_m)
                     + bx_m
@@ -571,31 +684,83 @@ def compile_blockscale_preshuffle_gemm_layout(
                 )
                 for mi in range_constexpr(m_repeat)
             ]
-            # Column assignment per lane for accumulator slot `ni` is
-            # (ni * wave_n + n_wave) * 16 + lane_mod_16 -- the TiledMma wave
-            # layout interleaves waves across N rather than giving each wave one
-            # contiguous n_per_wave block (verified against preshuffle_gemm.py's
-            # own epilogue, which reads scale/bias with this exact formula), and
-            # the same interleaving applies down M once wave_m > 1.
-            s_b = [
-                _read_sb_scalar(
-                    (
-                        (by_n + (ni * wave_n + n_wave) * 16 + lane_mod_16)
-                        // fx.Int32(128)
+
+        def load_b_scale_vals(k_tile):
+            """One value per entry of sb_distinct (see sb_index)."""
+            kb = fx.Int32(k_tile)
+            if const_expr(scalar_b_scale):
+                by_blk = by_n // fx.Int32(128)
+                vals = []
+                for b in sb_distinct:
+                    raw = buffer_ops.buffer_load(
+                        scale_b_rsrc,
+                        (by_blk + fx.Int32(b)) * fx.Int32(scale_k) + kb,
+                        vec_width=1,
+                        is_scalar=True,
                     )
+                    vals.append(fx.Int32(raw).bitcast(Float32))
+                return vals
+            return [
+                _read_sb_scalar(
+                    ((by_n + (ni * wave_n + n_wave) * 16 + lane_mod_16) // fx.Int32(128))
                     * fx.Int32(scale_k)
                     + kb
                 )
                 for ni in range_constexpr(num_acc_n)
             ]
-            return s_a, s_b
+
+        if const_expr(stage_a_scales):
+            sa_lds = lds.sa.ptr
+
+            def dma_scale_a_to_lds(k_tile_val, stage):
+                # One 4-byte-per-lane DMA covers 64 rows; with tile_m=128 the
+                # waves split the two chunks rather than each issuing both.
+                chunk = 0 if sa_dma_per_tile == 1 else wave_id % sa_dma_per_tile
+                g_byte = (
+                    (k_off + k_tile_val) * fx.Int32(i32_m) + bx_m + chunk * 64 + lane_id
+                ) * 4
+                lds_addr = fx.Int64(fx.ptrtoint(sa_lds)) + fx.Int64(
+                    (stage * sa_stage_elems + chunk * 64) * 4
+                )
+                rocdl.raw_ptr_buffer_load_lds(
+                    scale_a_rsrc,
+                    llvm.inttoptr(
+                        ir.Type.parse("!llvm.ptr<3>"),
+                        rocdl.readfirstlane(T.i64, lds_addr),
+                    ),
+                    fx.Int32(4),
+                    fx.Int32(g_byte),
+                    fx.Int32(0),
+                    fx.Int32(0),
+                    fx.Int32(1),
+                )
+
+            def read_a_scales_lds(stage):
+                return [
+                    Vec(
+                        fx.ptr_load(
+                            sa_lds
+                            + fx.Int32(stage * sa_stage_elems)
+                            + ((mi * wave_m + m_wave) * 16 + row_off_base),
+                            result_type=T.vec(4, T.f32),
+                        )
+                    )
+                    for mi in range_constexpr(m_repeat)
+                ]
+
+        def load_tile_scales(k_tile):
+            s_b_vals = load_b_scale_vals(k_tile)
+            return (
+                load_a_scale_vals(k_tile),
+                [s_b_vals[sb_index[ni]] for ni in range_constexpr(num_acc_n)],
+            )
 
         # ── Scheduling hints: interleave the per-16x16 MFMA stripes with the
         # next tile's copies, matching preshuffle_gemm.py's own gfx942 branch
         # (no sched_valu, no wave-role stagger -- see module docstring). ──
         def hot_loop_scheduler():
             mfma_group = num_acc_n
-            mfma_total = (k_iters * 2) * m_repeat * mfma_group
+            mfma_total = (k_iters * mfma_per_k_iter) * m_repeat * mfma_group
             mfma_per_iter = 2 * mfma_group
             sche_iters = 0 if mfma_per_iter == 0 else (mfma_total // mfma_per_iter)
             rocdl.sched_dsrd(2)
@@ -676,6 +841,10 @@ def compile_blockscale_preshuffle_gemm_layout(
         # (the loop's own ds_write targets tile t+a_write_ahead), and for
         # prefetch depth 2 also pre-load the tile the loop's first ds_write
         # will consume, so iteration 0 never waits on its own global load.
+        if const_expr(stage_a_scales):
+            for s in range_constexpr(a_write_ahead):
+                if const_expr(s < num_tiles):
+                    dma_scale_a_to_lds(fx.Int32(s), s)
         if const_expr(use_async_copy):
             for s in range_constexpr(a_write_ahead):
                 if const_expr(s < num_tiles):
@@ -705,6 +874,15 @@ def compile_blockscale_preshuffle_gemm_layout(
                 )
             fx.copy(buf_copy, pB_g[None, None, None, k_off], frag_B_retile_stages[0])
             frag_running.store(acc_zero)
+            if const_expr(stage_a_scales):
+                rocdl.s_waitcnt(
+                    vmcnt=num_b_loads
+                    + (
+                        num_a_loads
+                        if (a_prefetch_depth == 2 and a_write_ahead < num_tiles)
+                        else 0
+                    )
+                )
             gpu.barrier()
         rocdl.sched_barrier(0)
 
@@ -728,17 +906,82 @@ def compile_blockscale_preshuffle_gemm_layout(
         # across real loop iterations (required for scf.for's SSA form, same
         # as preshuffle_gemm.py's frag_C -- storage is the same object either
         # way, this is just what makes the loop-carried dependency explicit).
-        def pipeline_tile(pos, cur_k_val, cur_tile, last_tile):
+        def pipeline_tile(pos, cur_k_val, cur_tile, last_tile, scales=None):
             """One tile. `pos` is the COMPILE-TIME position modulo
             tiles_per_iter, used to derive both ring indices; `cur_tile`/
             `last_tile` decide which prefetches are in range; `cur_k_val` is the
-            (possibly traced) tile index actually addressed."""
+            (possibly traced) tile index actually addressed.
+
+            With prefetch_scales, `scales` holds this tile's (s_a, s_b), loaded
+            one tile earlier, and the return value is the next tile's."""
             read_stage = pos % lds_stages
             a_write_stage = (pos + a_write_ahead) % lds_stages
             b_write_stage = (pos + 1) % 2
             do_a_load = (cur_tile + a_load_ahead) <= last_tile
             do_a_write = (cur_tile + a_write_ahead) <= last_tile
             do_b_load = (cur_tile + 1) <= last_tile
+            if const_expr(prefetch_scales):
+                # Issued after this tile's A/B prefetches and consumed a whole
+                # tile later. vmcnt retires in order, so a same-tile scale load
+                # made the combine wait on those prefetches as well, which
+                # serialised the copy behind the MFMAs it was meant to hide under.
+                s_a_held, s_b_vals = scales
+                if const_expr(stage_a_scales and do_a_write):
+                    # Rides the A stage it belongs to, a full tile ahead; issued
+                    # first so the vmcnt wait before the barrier can leave the
+                    # B loads behind it in flight.
+                    dma_scale_a_to_lds(cur_k_val + fx.Int32(a_write_ahead), a_write_stage)
+                if const_expr(use_async_copy):
+                    if const_expr(do_a_write):
+                        dma_a_to_lds(cur_k_val + fx.Int32(a_write_ahead), a_write_stage)
+                else:
+                    if const_expr(do_a_load):
+                        fx.copy(
+                            buf_copy,
+                            pA_g[None, None, None, k_off + cur_k_val + a_load_ahead],
+                            frag_copy_A_stages[pos % 2 if a_prefetch_depth == 2 else 0],
+                        )
+                if const_expr(do_b_load):
+                    fx.copy(
+                        buf_copy,
+                        pB_g[None, None, None, k_off + cur_k_val + fx.Int32(1)],
+                        frag_B_retile_stages[b_write_stage],
+                    )
+                nxt = None
+                if const_expr(do_b_load):
+                    k_next = k_off + cur_k_val + fx.Int32(1)
+                    nxt = (
+                        [] if stage_a_scales else load_a_scale_vals(k_next),
+                        load_b_scale_vals(k_next),
+                    )
+                s_a = read_a_scales_lds(read_stage) if stage_a_scales else s_a_held
+                s_b = [s_b_vals[sb_index[ni]] for ni in range_constexpr(num_acc_n)]
+                mma_kloop_block(read_stage, frag_B_stages[pos % 2], s_a, s_b)
+                if const_expr(do_a_write and not use_async_copy):
+                    fx.copy(
+                        uni_copy,
+                        frag_copy_A_stages[(pos + 1) % 2 if a_prefetch_depth == 2 else 0],
+                        pA_s_stages[a_write_stage][None, None, None],
+                    )
+                if const_expr(enable_scheduler):
+                    hot_loop_scheduler()
+                if const_expr(do_a_write):
+                    if const_expr(use_async_copy or stage_a_scales):
+                        # Drain the DMAs into the stage being published. vmcnt
+                        # retires in order and they were issued before the B
+                        # (and, for depth 2, the still-unconsumed A) loads,
+                        # which may stay in flight; the held A-scales come last.
+                        rocdl.s_waitcnt(
+                            vmcnt=num_b_loads
+                            + (0 if stage_a_scales else num_scale_vmem)
+                            + (
+                                num_a_loads
+                                if (a_prefetch_depth == 2 and not use_async_copy)
+                                else 0
+                            )
+                        )
+                    gpu.barrier()
+                return nxt
             if const_expr(use_async_copy):
                 # One hop: global -> LDS. Nothing to ds_write, so nothing for
                 # the next tile's LDS fill to stall on mid-iteration.
@@ -802,23 +1045,50 @@ def compile_blockscale_preshuffle_gemm_layout(
         # below passes real positions so its prefetches compile out at the end.
         INTERIOR = num_tiles
 
-        def loop_body(k_base):
+        def loop_body(k_base, scales):
             for j in range_constexpr(tiles_per_iter):
-                pipeline_tile(j, k_base + fx.Int32(j), 0, INTERIOR)
+                scales = pipeline_tile(j, k_base + fx.Int32(j), 0, INTERIOR, scales)
+            return scales
 
         # The loop may only cover tiles whose deepest prefetch is still in
         # range, so the peel grows with both the ring depth and prefetch depth.
         last_tile = num_tiles - 1
         loop_end = max(0, num_tiles - a_load_ahead) // tiles_per_iter
+        if const_expr(full_unroll):
+            loop_end = 0
 
+        # Scales ride the device loop's carried state next to the running
+        # accumulator, flattened: the held A-scale vec4s (none when staged in
+        # LDS), then one B-scale per sb_distinct entry.
+        n_sa_state = 0 if stage_a_scales else m_repeat
+
+        def _flat(scales):
+            return [] if scales is None else [*scales[0], *scales[1]]
+
+        def _unflat(vals):
+            return (list(vals[:n_sa_state]), list(vals[n_sa_state:]))
+
+        scales = None
+        if const_expr(prefetch_scales):
+            scales = (
+                [] if stage_a_scales else load_a_scale_vals(k_off),
+                load_b_scale_vals(k_off),
+            )
         if const_expr(loop_end > 0):
-            for iv, state in range(0, loop_end, 1, init=[frag_running.load()]):
+            for iv, state in range(
+                0, loop_end, 1, init=[frag_running.load(), *_flat(scales)]
+            ):
                 frag_running.store(state[0])
-                loop_body(fx.Int32(iv * tiles_per_iter))
-                results = yield [frag_running.load()]
-            frag_running.store(results)
+                cur = _unflat(state[1:]) if prefetch_scales else None
+                nxt = loop_body(fx.Int32(iv * tiles_per_iter), cur)
+                results = yield [frag_running.load(), *_flat(nxt)]
+            if const_expr(prefetch_scales):
+                frag_running.store(results[0])
+                scales = _unflat(results[1:])
+            else:
+                frag_running.store(results)
         for t in range_constexpr(loop_end * tiles_per_iter, num_tiles):
-            pipeline_tile(t % tiles_per_iter, fx.Int32(t), t, last_tile)
+            scales = pipeline_tile(t % tiles_per_iter, fx.Int32(t), t, last_tile, scales)
 
         # ── Epilogue ──────────────────────────────────────────────────────
         # Direct store writes the MFMA's native C layout, where a lane owns 4

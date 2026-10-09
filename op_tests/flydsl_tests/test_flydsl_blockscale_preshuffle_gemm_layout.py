@@ -239,7 +239,7 @@ def test_occupancy_knobs_are_numerically_neutral():
                     )
 
 
-def test_tile_and_swizzle_heuristics():
+def test_tile_and_swizzle_heuristics(monkeypatch):
     """Tile comes from grid size and K; the XCD swizzle follows the tile.
 
     The swizzle lifts the L2 hit rate on every shape measured, but 64x256 is
@@ -247,12 +247,15 @@ def test_tile_and_swizzle_heuristics():
     is the sole opt-out."""
     import torch as _torch
 
+    from aiter.ops.flydsl import gemm_kernels
     from aiter.ops.flydsl.gemm_kernels import (
         _blockscale_layout_swizzle_cfg,
         _blockscale_layout_tile_cfg,
         _blockscale_layout_wave_m_cfg,
     )
 
+    # These are the gfx942 rules; gfx950 has its own (tested below).
+    monkeypatch.setattr(gemm_kernels, "_blockscale_layout_is_gfx950", lambda: False)
     dev = _torch.device("cuda", 0)
 
     # Deep K with enough workgroups takes the wide tile; shallow K does not.
@@ -273,6 +276,80 @@ def test_tile_and_swizzle_heuristics():
     assert _blockscale_layout_wave_m_cfg(128, 128) == 2
     for tile in ((64, 256), (64, 128), (32, 64)):
         assert _blockscale_layout_wave_m_cfg(*tile) == 1, tile
+
+
+def test_gfx950_tile_and_scale_heuristics(monkeypatch):
+    """gfx950 picks 32x64 below one wave of 64x128 workgroups, 64x256 only for
+    one or two full waves with N >= 1024, else 64x128; the 64-row tiles stage
+    their A-scales in LDS."""
+    from aiter.ops.flydsl import gemm_kernels
+    from aiter.ops.flydsl.gemm_kernels import (
+        _blockscale_layout_scale_cfg,
+        _blockscale_layout_tile_cfg_gfx950 as tile_cfg,
+    )
+
+    cu = 256
+    assert tile_cfg(128, 4096, cu) == (32, 64)
+    assert tile_cfg(1024, 1536, cu) == (32, 64)
+    assert tile_cfg(4096, 512, cu) == (64, 128)
+    assert tile_cfg(8192, 1024, cu) == (64, 256)
+    assert tile_cfg(2048, 4096, cu) == (64, 256)
+    # A partial last wave, a larger grid, or narrow N falls back to 64x128.
+    assert tile_cfg(4096, 1536, cu) == (64, 128)
+    assert tile_cfg(32768, 1024, cu) == (64, 128)
+    assert tile_cfg(16384, 512, cu) == (64, 128)
+    tm, tn = tile_cfg(1024, 1024 + 64, cu)
+    assert (1024 + 64) % tn == 0, (tm, tn)
+
+    monkeypatch.setattr(gemm_kernels, "_blockscale_layout_is_gfx950", lambda: True)
+    assert _blockscale_layout_scale_cfg(32, 64) == {}
+    assert _blockscale_layout_scale_cfg(64, 128) == {
+        "stage_a_scales": True,
+        "a_prefetch_depth": 2,
+    }
+    assert _blockscale_layout_scale_cfg(128, 128) == {
+        "stage_a_scales": True,
+        "use_async_copy": True,
+    }
+    monkeypatch.setattr(gemm_kernels, "_blockscale_layout_is_gfx950", lambda: False)
+    assert _blockscale_layout_scale_cfg(64, 128) == {}
+
+
+@pytest.mark.skipif(not _GFX.startswith("gfx95"), reason="K128 MFMA is gfx950-only")
+@pytest.mark.parametrize(
+    "tile_m,tile_n,extra",
+    [
+        (64, 128, {"a_prefetch_depth": 2}),
+        (64, 128, {}),
+        (128, 128, {"use_async_copy": True, "wave_m": 2}),
+        (64, 256, {"a_prefetch_depth": 2}),
+    ],
+)
+def test_stage_a_scales_matches_oracle(tile_m, tile_n, extra):
+    """A-scales DMA'd into the A stage's LDS slot, across the sync (depth 1 and
+    2) and async A paths, ragged M and an odd K-tile count."""
+    for m, n, k in ((384, 1024, 1024), (513, 768, 896)):
+        if n % tile_n:
+            continue
+        x, w, x_scale, w_scale, w_shuf, x_scale_km = make_inputs(m, n, k)
+        ref = run_torch(x, w, x_scale, w_scale)
+        out = torch.zeros((m, n), dtype=torch.bfloat16, device="cuda")
+        exe = compile_blockscale_preshuffle_gemm_layout(
+            N=n, K=k, tile_m=tile_m, tile_n=tile_n, tile_k=128, out_dtype="bf16",
+            num_waves=4, stage_a_scales=True, **extra,
+        )
+        semaphore = torch.empty(0, dtype=torch.int32, device="cuda")
+        _run_compiled(
+            exe, out, out, semaphore,
+            x.contiguous(), w_shuf.contiguous(),
+            x_scale_km.contiguous().view(-1), w_scale.contiguous().view(-1),
+            m, n, fx.Stream(torch.cuda.current_stream()),
+        )
+        torch.cuda.synchronize()
+        rel = rel_norm(ref, out)
+        assert rel <= DEFAULT_REL_TOL, (
+            f"{tile_m}x{tile_n} {extra} m={m} n={n} k={k}: rel={rel:.3e}"
+        )
 
 
 def test_direct_kernel_entrypoint_matches_oracle():

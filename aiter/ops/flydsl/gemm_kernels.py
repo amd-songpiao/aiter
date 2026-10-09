@@ -540,6 +540,7 @@ def _compile_flydsl_blockscale(
     use_async_copy: bool | None = None,
     num_waves: int = 4,
     stage_a_scales: bool = True,
+    late_scale_combine: bool = True,
 ):
     """Cached compile. M is not part of the key: the kernel takes it at runtime.
 
@@ -568,6 +569,7 @@ def _compile_flydsl_blockscale(
         use_async_copy=use_async_copy,
         num_waves=num_waves,
         stage_a_scales=stage_a_scales,
+        late_scale_combine=late_scale_combine,
     )
 
 
@@ -586,6 +588,7 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
     use_async_copy: bool | None = None,
     num_waves: int = 4,
     stage_a_scales: bool = True,
+    late_scale_combine: bool = True,
 ) -> Tensor:
     """Compile (cached) and run the FlyDSL blockscale bpreshuffle GEMM.
 
@@ -666,6 +669,7 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
         use_async_copy=use_async_copy,
         num_waves=num_waves,
         stage_a_scales=stage_a_scales,
+        late_scale_combine=late_scale_combine,
     )
 
     # The kernel indexes scale_a as kb * M + row, so x_scale must reach it K-major.
@@ -852,6 +856,55 @@ _LAYOUT_DEEPK_MIN_GRID = 128
 _LAYOUT_SHRINK_MAX_GRID = 192
 
 
+@functools.lru_cache(maxsize=1)
+def _blockscale_layout_is_gfx950() -> bool:
+    return get_gfx().startswith("gfx95")
+
+
+def _blockscale_layout_tile_cfg_gfx950(m: int, n: int, cu: int) -> tuple[int, int]:
+    """gfx950 tile choice. The K128 MFMA and LDS-staged A-scales (see
+    _blockscale_layout_scale_cfg) shift every crossover from gfx942's, so this
+    is fitted separately over 17 shapes (synthetic + DeepSeek gfx950 tuned
+    rows), landing within ~3% of the per-shape oracle of the four tiles.
+
+    32x64 once 64x128 would leave CUs idle (smallm128 1.61x, deep_k 1.17x
+    over the hand-rolled kernel). 64x256 only for one or two full waves of
+    workgroups with N >= 1024: there its reuse wins (m8192 1.04x,
+    m8192_deepk 1.04x), but a partial last wave (1536-wide DeepSeek rows,
+    0.76x against 64x128's 0.96x) or larger grids hand it back. 64x128
+    otherwise. 128x128 is never picked: it needs async A to stay under 256
+    VGPRs and loses to 64x128 on all but one measured shape.
+    """
+    tm, tn = _LAYOUT_TILE_MID
+    if n % tn:
+        return tm, 64
+    if ((m + tm - 1) // tm) * (n // tn) < cu:
+        return _LAYOUT_TILE_SMALL
+    tm, tn = _LAYOUT_TILE_DEEPK
+    if n % tn == 0 and n >= 1024:
+        grid = ((m + tm - 1) // tm) * (n // tn)
+        if grid % cu == 0 and grid <= 2 * cu:
+            return tm, tn
+    return _LAYOUT_TILE_MID
+
+
+def _blockscale_layout_scale_cfg(tile_m: int, tile_n: int) -> dict:
+    """gfx950-only A-scale/A-staging defaults for tiles of 64+ rows.
+
+    stage_a_scales DMAs each tile's A-scales into the A stage's LDS slot, so
+    they no longer occupy registers across the whole tile. That is what lets
+    64-high tiles afford a_prefetch_depth=2 (64x128: 0.74x -> 0.88x of the
+    hand-rolled kernel) and keeps 128x128 under the 256-VGPR cliff with async
+    A (264 -> 240 VGPRs). The 32x64 tile has the registers to hold them and
+    loses to staging (deep_k 1.17x -> 0.83x).
+    """
+    if not _blockscale_layout_is_gfx950() or tile_m < 64:
+        return {}
+    if (tile_m, tile_n) == _LAYOUT_TILE_LARGE:
+        return {"stage_a_scales": True, "use_async_copy": True}
+    return {"stage_a_scales": True, "a_prefetch_depth": 2}
+
+
 def _blockscale_layout_tile_cfg(
     m: int, n: int, k: int, device: torch.device
 ) -> tuple[int, int]:
@@ -887,6 +940,8 @@ def _blockscale_layout_tile_cfg(
     the shrink boundary lose ~12% to the 32-high tile (320x2048x2048).
     """
     cu = _cu_count(device.index or 0)
+    if _blockscale_layout_is_gfx950():
+        return _blockscale_layout_tile_cfg_gfx950(m, n, cu)
     tm, tn = _LAYOUT_TILE_DEEPK
     if k >= _LAYOUT_DEEPK_MIN_K and n % tn == 0:
         if ((m + tm - 1) // tm) * (n // tn) >= _LAYOUT_DEEPK_MIN_GRID:
@@ -919,6 +974,7 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle_layout(
     use_cshuffle_epilog: int = -1,
     use_xcd_swizzle: int = -1,
     wave_m: int = -1,
+    **compile_overrides,
 ) -> Tensor:
     """Compile (cached) and run the FlyDSL blockscale bpreshuffle GEMM, layout-API
     variant. Same calling convention, layouts, and numerics as
@@ -968,6 +1024,9 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle_layout(
         heur_cs = False
     heur_swz = _blockscale_layout_swizzle_cfg(tile_m, tile_n)
     heur_wm = _blockscale_layout_wave_m_cfg(tile_m, tile_n)
+    scale_cfg = _blockscale_layout_scale_cfg(tile_m, tile_n)
+    heur_depth = scale_cfg.pop("a_prefetch_depth", heur_depth)
+    compile_overrides = {**scale_cfg, **compile_overrides}
     exe = compile_fn(
         N=n,
         K=k,
@@ -987,6 +1046,7 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle_layout(
             heur_swz if use_xcd_swizzle == -1 else bool(use_xcd_swizzle)
         ),
         wave_m=heur_wm if wave_m == -1 else wave_m,
+        **compile_overrides,
     )
 
     if x_scale.dim() == 2 and x_scale.stride(0) == 1 and x_scale.size(1) > 1:
