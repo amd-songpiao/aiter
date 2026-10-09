@@ -18,7 +18,7 @@ aborts the process inside the backend.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, vector
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -31,7 +31,6 @@ from aiter.ops.flydsl.kernels.mfma_epilogues import mfma_epilog
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import (
     _buffer_load_vec,
     buffer_copy_gmem16_dwordx4,
-    load_b_pack_k32,
     swizzle_xor16,
     tile_chunk_coord_i32,
 )
@@ -150,6 +149,7 @@ def compile_blockscale_preshuffle_gemm(
     use_async_copy: bool = False,
     num_waves: int = NUM_WAVES,
     stage_a_scales: bool = False,
+    late_scale_combine: bool = True,
 ):
     """Compile blockscale preshuffle GEMM. FP8 input, per-block scales, bf16/fp16 output."""
     if out_dtype not in ("fp16", "bf16"):
@@ -270,7 +270,6 @@ def compile_blockscale_preshuffle_gemm(
         ping: fx.Array[fx.Uint8, buffer_size_elems, 16]
 
     # ── Compile-time layout constants ─────────────────────────────────────
-    kpack_bytes = 16
     kpack_elems = 16  # fp8: 1 byte per element
     _k_div4_factor = K // 4
 
@@ -376,24 +375,6 @@ def compile_blockscale_preshuffle_gemm(
             n_intra_list.append(global_n % 16)
 
         # ── B load helpers ────────────────────────────────────────────────
-        def load_b_pack(base_k, ki_step, ni):
-            return load_b_pack_k32(
-                buffer_ops,
-                arith,
-                vector,
-                arg_b=arg_b,
-                b_rsrc=b_rsrc,
-                layout_b=layout_b,
-                base_k=base_k,
-                ki_step=ki_step,
-                n_blk=n_blk_list[ni],
-                n_intra=n_intra_list[ni],
-                lane_div_16=lane_div_16,
-                elem_type=default_f8_type(),
-                kpack_bytes=kpack_bytes,
-                elem_bytes=elem_bytes,
-            )
-
         c64_b = 64
         _lds_k_dim_c = tile_k
 
@@ -406,7 +387,6 @@ def compile_blockscale_preshuffle_gemm(
             idx_pack = _crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
             b16 = _buffer_load_vec(
                 buffer_ops,
-                vector,
                 b_rsrc,
                 idx_pack,
                 elem_type=default_f8_type(),
@@ -503,7 +483,6 @@ def compile_blockscale_preshuffle_gemm(
             if const_expr(a_load_bytes_v == 16):
                 return buffer_copy_gmem16_dwordx4(
                     buffer_ops,
-                    vector,
                     elem_type=default_f8_type(),
                     idx_i32=idx_i32,
                     rsrc=a_rsrc,
@@ -516,7 +495,6 @@ def compile_blockscale_preshuffle_gemm(
 
         def a_tile_chunk_coord_i32(i: int, tx_i32_base_v, chunk_i32_a_v):
             return tile_chunk_coord_i32(
-                arith,
                 tx_i32_base=tx_i32_base_v,
                 i=i,
                 total_threads=total_threads,
@@ -567,7 +545,6 @@ def compile_blockscale_preshuffle_gemm(
 
         def a_tile_chunk_coord_i32_async(i: int):
             return tile_chunk_coord_i32(
-                arith,
                 tx_i32_base=tx_i32_async_base,
                 i=i,
                 total_threads=total_threads,
@@ -723,9 +700,12 @@ def compile_blockscale_preshuffle_gemm(
             for sb in range_constexpr(sb_per_tile):
                 # First use of this tile's scale loads, a full tile of MFMA after
                 # they were issued, so the wait should already be satisfied.
-                combined_scales = _combine_scale_block(
-                    *pre_scales[sb], sb=sb, lds_buffer=lds_buffer
-                )
+                # Combining after the MFMAs instead keeps the products out of the
+                # registers the MFMAs need.
+                if const_expr(not late_scale_combine):
+                    combined_scales = _combine_scale_block(
+                        *pre_scales[sb], sb=sb, lds_buffer=lds_buffer
+                    )
                 block_accs = [acc_init] * (num_acc_n * m_repeat)
 
                 if const_expr(_is_gfx950):
@@ -804,6 +784,10 @@ def compile_blockscale_preshuffle_gemm(
                                     b_packs1[ni],
                                 )
 
+                if const_expr(late_scale_combine):
+                    combined_scales = _combine_scale_block(
+                        *pre_scales[sb], sb=sb, lds_buffer=lds_buffer
+                    )
                 for mi in range_constexpr(m_repeat):
                     for ni in range_constexpr(num_acc_n):
                         acc_idx = mi * num_acc_n + ni
@@ -903,8 +887,6 @@ def compile_blockscale_preshuffle_gemm(
 
             mfma_epilog(
                 use_cshuffle=False,
-                arith=arith,
-                range_constexpr=range_constexpr,
                 m_repeat=m_repeat,
                 lane_div_16=lane_div_16,
                 bx_m=bx_m,

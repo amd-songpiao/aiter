@@ -18,7 +18,6 @@ import pytest
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.shuffle import shuffle_weight
 
 if not torch.cuda.is_available():
@@ -31,12 +30,6 @@ if not (_GFX.startswith("gfx942") or _GFX.startswith("gfx95")):
         f"blockscale bpreshuffle GEMM needs gfx942/gfx95x, got {_GFX}",
         allow_module_level=True,
     )
-if not is_flydsl_available():
-    pytest.skip(
-        "flydsl is not installed. Skipping FlyDSL block-scale GEMM tests.",
-        allow_module_level=True,
-    )
-
 try:
     from aiter import dtypes
     from aiter.ops.flydsl.kernels.gemm_blockscale_preshuffle import (
