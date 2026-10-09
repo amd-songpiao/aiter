@@ -60,6 +60,19 @@ except ImportError as _flydsl_import_err:
     kernels_list_flydsl = {}
     fits_shape_flydsl = None
 
+try:
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_common import (
+        kernels_list as kernels_list_flydsl_bs,
+        tile_is_valid as tile_is_valid_flydsl_bs,
+    )
+except ImportError as _flydsl_bs_import_err:
+    print(
+        f"[FlyDSL] blockscale bpreshuffle catalog unavailable "
+        f"({_flydsl_bs_import_err}); FlyDSL blockscale tuning disabled"
+    )
+    kernels_list_flydsl_bs = {}
+    tile_is_valid_flydsl_bs = None
+
 
 block_shape = (128, 128)
 
@@ -208,6 +221,23 @@ def run_gemm_a8w8_blockscale_flydsl(
 
     return run_gemm_a8w8_mxscale_preshuffle_gfx950(
         x, weight_shuffle, x_scale_shuf, w_scale_shuf, out, kernel_name
+    )
+
+
+def run_gemm_a8w8_blockscale_flydsl_bs(
+    x,
+    weight_shuffle,
+    x_scale_t,
+    w_scale,
+    out,
+    kernel_name,
+):
+    """FlyDSL fp32-scale blockscale kernel, through the same entry the tuned-CSV
+    dispatch uses, so a measured row runs exactly as it will in production."""
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_flydsl
+
+    return gemm_a8w8_blockscale_flydsl(
+        x, weight_shuffle, x_scale_t, w_scale, out, {"kernelName": kernel_name}
     )
 
 
@@ -425,9 +455,18 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             "--libtype",
             type=str,
             default="all",
-            choices=["ck", "cktile", "asm", "opus", "flydsl", "all", "both"],
+            choices=[
+                "ck",
+                "cktile",
+                "asm",
+                "opus",
+                "flydsl",
+                "flydsl_blockscale",
+                "all",
+                "both",
+            ],
             required=False,
-            help="CK gemm a8w8 blockscale type to tune: ck, cktile, asm, opus, flydsl, both or all. 'all'/'both' cover the fp32 backends only; 'flydsl' is the e8m0 mxpsh group (requires --preshuffle) and writes the mxscale table.",
+            help="CK gemm a8w8 blockscale type to tune: ck, cktile, asm, opus, flydsl, flydsl_blockscale, both or all. 'all'/'both' cover the fp32 backends only, and 'all' includes flydsl_blockscale; 'flydsl_blockscale' is the fp32-scale FlyDSL kernel (--preshuffle, gfx942/gfx950) and writes libtype=flydsl rows to the bpreshuffle table; 'flydsl' is the e8m0 mxpsh group (requires --preshuffle) and writes the mxscale table.",
         )
 
         self.parser.add_argument(
@@ -730,6 +769,58 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             )
         return tasks_flydsl
 
+    def get_gemm_a8w8_blockscale_flydsl_bs_tune_task(
+        self,
+        info_keys,
+        seed,
+        preshuffleB,
+        run_kwargs,
+    ):
+        gfx, _, M, N, K, *_ = info_keys
+        if not preshuffleB or gfx not in ("gfx942", "gfx950"):
+            return []
+        if not kernels_list_flydsl_bs or tile_is_valid_flydsl_bs is None:
+            return []
+
+        gemm_keys = ["x", "weight_shuffle", "x_scale_t", "w_scale", "out"]
+        ref_args = (["x", "weight", "x_scale", "w_scale"], None, dtypes.bf16)
+        tasks = []
+        for kernel_id, ki in kernels_list_flydsl_bs.items():
+            if not tile_is_valid_flydsl_bs(
+                ki.tile_m,
+                ki.tile_n,
+                ki.tile_k,
+                N,
+                K,
+                ki.scale_block_k,
+                num_waves=ki.num_waves,
+                use_cshuffle_epilog=ki.use_cshuffle_epilog,
+            ):
+                continue
+            # Dispatch reads the whole config back from kernelName; kernelId is
+            # recorded for reference only.
+            info = (info_keys, kernel_id, 0, ki.name, "flydsl", preshuffleB)
+            tasks.append(
+                (
+                    info,
+                    generate_data,
+                    (M, N, K, seed),
+                    run_gemm_a8w8_blockscale_flydsl_bs,
+                    (gemm_keys, ki.name),
+                    dict(run_kwargs),
+                    run_torch,
+                    ref_args,
+                    {},
+                    None,
+                    1e-2,
+                    0.01,
+                    None,
+                    None,
+                    ("out",),
+                )
+            )
+        return tasks
+
     def run_config(self, args):
         from aiter.ops.gemm_op_a8w8 import (
             gemm_a8w8_blockscale,
@@ -949,6 +1040,15 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             if lib in ("opus", "all"):
                 task.extend(
                     self.get_gemm_a8w8_blockscale_opus_tune_task(
+                        info_keys,
+                        seed,
+                        isPreshuffleB,
+                        run_kwargs,
+                    )
+                )
+            if lib in ("flydsl_blockscale", "all"):
+                task.extend(
+                    self.get_gemm_a8w8_blockscale_flydsl_bs_tune_task(
                         info_keys,
                         seed,
                         isPreshuffleB,
