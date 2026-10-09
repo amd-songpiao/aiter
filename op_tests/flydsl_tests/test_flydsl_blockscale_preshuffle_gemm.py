@@ -374,6 +374,29 @@ def test_heuristic_tile_is_always_valid():
                 ), f"heuristic picked invalid tile {tile} for M={m} N={n} K={k}"
 
 
+def test_tile_waves_heuristic(monkeypatch):
+    """64x256 with 8 waves on gfx950 from K=1024 up, outside the two grid ranges
+    where it lost, and never with CShuffle or off gfx95."""
+    import aiter.ops.flydsl.gemm_kernels as gk
+
+    monkeypatch.setattr(gk, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(gk, "_cu_count", lambda _dev: 256)
+    wide = (64, 256, 128, 8)
+    # 64x256 grids of 8704, 1024, 448 and 192 (0.75*cu) workgroups.
+    for shape in ((32768, 4352, 5120), (8192, 2048, 1024), (1024, 7168, 7168),
+                  (2048, 1536, 7168)):
+        assert gk.select_blockscale_tile_waves(*shape) == wide, shape
+    # 288 and 384 workgroups (one round plus a sparse second), and 128 (0.5*cu).
+    for shape in ((2304, 2048, 5120), (4096, 1536, 7168), (4096, 512, 7168)):
+        assert gk.select_blockscale_tile_waves(*shape)[3] == 4, shape
+    assert gk.select_blockscale_tile_waves(32768, 4352, 768)[3] == 4
+    assert gk.select_blockscale_tile_waves(
+        32768, 4352, 5120, use_cshuffle_epilog=True
+    )[3] == 4
+    monkeypatch.setattr(gk, "get_gfx", lambda: "gfx942")
+    assert gk.select_blockscale_tile_waves(32768, 4352, 5120)[3] == 4
+
+
 def test_dispatch_matches_direct_call():
     """The same numbers must come out of gemm_a8w8_blockscale_bpreshuffle as out of
     the op called directly, i.e. the tuned-row plumbing (libtype, kernelName, the
@@ -530,6 +553,10 @@ def main() -> int:
         ("kernel_name_rejects_foreign", test_kernel_name_rejects_foreign_names),
         ("tile_candidates_append_only", test_tile_candidates_are_append_only),
         ("heuristic_tile_valid", test_heuristic_tile_is_always_valid),
+        (
+            "tile_waves_heuristic",
+            lambda: _run_with_monkeypatch(test_tile_waves_heuristic),
+        ),
         ("dispatch_matches_direct", test_dispatch_matches_direct_call),
         # test_real_dispatch_branch is the only check that drives
         # aiter.gemm_a8w8_blockscale_bpreshuffle through the new dispatch branch, so it

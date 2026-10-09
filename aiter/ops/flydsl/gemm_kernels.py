@@ -526,6 +526,42 @@ def select_blockscale_tile_config(
     return max(valid, key=_score)
 
 
+def select_blockscale_tile_waves(
+    m: int,
+    n: int,
+    k: int,
+    scale_block_k: int = 128,
+    use_cshuffle_epilog: bool = False,
+) -> tuple:
+    """Heuristic (tile_m, tile_n, tile_k, num_waves) for shapes with no tuned row.
+
+    On gfx950, 64x256 with 8 waves beats 64x128 with 4 from K=1024 up (1.06-1.07x
+    geomean over 67 shapes; 32768x2048x5120 1.17x, 3328x2048x5120 1.22x), while
+    64x256 with 4 waves gains under 1%. It loses with CShuffle at K <= 768
+    (20480x7168x256 0.88x), and on two grid ranges: more than cu and at most
+    1.5*cu workgroups, one round plus a sparse second, lose 5-9% (2304x2048x5120
+    0.91x, 4096x1536x7168 0.95x) where 1.6*cu already wins 1.22x; and under
+    0.75*cu the GPU is left part idle (4096x512x7168, 0.5*cu, 0.81x) where
+    0.75*cu still wins 1.06x (2048x1536x7168).
+    """
+    tile = select_blockscale_tile_config(
+        m, n, k, scale_block_k, use_cshuffle_epilog, 4
+    )
+    wide = (64, 256, 128)
+    if (
+        get_gfx().startswith("gfx95")
+        and k >= 1024
+        and not use_cshuffle_epilog
+        and tile == (64, 128, 128)
+        and _blockscale_tile_is_valid(*wide, n, k, scale_block_k, False, 8)
+    ):
+        cu = _cu_count(torch.cuda.current_device())
+        wide_wgs = ((m + 63) // 64) * (n // 256)
+        if cu * 3 // 4 <= wide_wgs <= cu or wide_wgs > cu * 3 // 2:
+            return (*wide, 8)
+    return (*tile, 4)
+
+
 def default_use_cshuffle_epilog(m: int, n: int, k: int) -> bool:
     """gfx950: stage the output through LDS for wide stores when the epilogue
     dominates, i.e. short K with an output large against it.
@@ -602,7 +638,7 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
     use_cshuffle_epilog: bool | None = None,
     dsrd_depth: int | None = None,
     use_async_copy: bool | None = None,
-    num_waves: int = 4,
+    num_waves: int | None = None,
     stage_a_scales: bool = True,
     late_scale_combine: bool = True,
 ) -> Tensor:
@@ -615,7 +651,9 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
     Numerics are identical to gemm_a8w8_blockscale.
 
     use_cshuffle_epilog and use_async_copy default (None) to a shape/arch choice;
-    see default_use_cshuffle_epilog and default_use_async_copy.
+    see default_use_cshuffle_epilog and default_use_async_copy. A None num_waves
+    is picked with the tile (select_blockscale_tile_waves) when the tile is too,
+    and is 4 otherwise.
     """
     compile_fn = _get_blockscale_compile_fn()
     from aiter.utility import dtypes
@@ -647,19 +685,24 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
         use_async_copy = default_use_async_copy()
     if dsrd_depth is None:
         dsrd_depth = default_dsrd_depth()
+    tile_given = bool(tile_m and tile_n and tile_k)
+    if num_waves is None and tile_given:
+        num_waves = 4
     if use_cshuffle_epilog is None:
         use_cshuffle_epilog = default_use_cshuffle_epilog(m, n, k)
         if (
             use_cshuffle_epilog
-            and tile_m
-            and tile_n
-            and tile_k
+            and tile_given
             and not _blockscale_tile_is_valid(
                 tile_m, tile_n, tile_k, n, k, scale_block_k, True, num_waves
             )
         ):
             use_cshuffle_epilog = False
-    if not (tile_m and tile_n and tile_k):
+    if num_waves is None:
+        tile_m, tile_n, tile_k, num_waves = select_blockscale_tile_waves(
+            m, n, k, scale_block_k, use_cshuffle_epilog
+        )
+    elif not tile_given:
         tile_m, tile_n, tile_k = select_blockscale_tile_config(
             m,
             n,
