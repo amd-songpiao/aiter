@@ -462,6 +462,45 @@ def _blockscale_tile_is_valid(
     )
 
 
+# gfx942 tiles in order of per-workgroup efficiency, each with the grid it needs, in
+# CUs, before it is worth taking over the next one down.
+_BLOCKSCALE_GFX942_TILES = (
+    ((64, 256, 128), 0.5),
+    ((64, 128, 128), 0.5),
+    ((32, 128, 128), 0.5),
+    ((32, 64, 128), 1),
+)
+# Its fallback when nothing above fills the GPU: the most workgroups.
+_BLOCKSCALE_GFX942_SMALL_TILE = (16, 64, 256)
+# At or below this M the 16-row tile is right regardless of grid, which the
+# FlyDSL scoring already gets right.
+_BLOCKSCALE_GFX942_DECODE_M = 48
+
+
+def _blockscale_tile_cfg_gfx942(m, n, valid, cu):
+    """Take the most efficient tile that still fills the GPU.
+
+    The FlyDSL scoring tiers the grid at 64/128/256 workgroups, too few for 304
+    CUs, so it took 64x256 down to grids of 9-30 workgroups and lost 1.5-2.5x
+    there. Fitted on 64 shapes (1.171x geomean over that scoring, against 1.180x
+    for the best tile per shape) and checked on 40 held-out ones (1.163x against
+    1.166x); no shape in either set lost more than 3%, the noise floor. Against
+    the old scoring on 48 further shapes: 1.29x, up to 4x where it starved the
+    grid.
+    """
+    for t, waves in _BLOCKSCALE_GFX942_TILES:
+        if t in valid and ((m + t[0] - 1) // t[0]) * (n // t[1]) >= waves * cu:
+            return t
+    fallback = [t for t, _ in _BLOCKSCALE_GFX942_TILES] + [
+        _BLOCKSCALE_GFX942_SMALL_TILE
+    ]
+    fallback = [t for t in fallback if t in valid]
+    if not fallback:
+        return None
+    # max keeps the first of equal grids, i.e. the more efficient tile.
+    return max(fallback, key=lambda t: ((m + t[0] - 1) // t[0]) * (n // t[1]))
+
+
 @functools.lru_cache(maxsize=1024)
 def select_blockscale_tile_config(
     m: int,
@@ -474,8 +513,8 @@ def select_blockscale_tile_config(
     """Heuristic tile pick for shapes with no tuned row; prefer a tuned kernelName.
 
     Weights come from FlyDSL's select_tile_config (tests/kernels/
-    test_blockscale_preshuffle_gemm.py at 950bed53, deleted by FlyDSL #966). The
-    tile_n term below is the one aiter change.
+    test_blockscale_preshuffle_gemm.py at 950bed53, deleted by FlyDSL #966). On
+    gfx942 above decode M, _blockscale_tile_cfg_gfx942 replaces them.
     """
     valid = [
         t
@@ -491,7 +530,12 @@ def select_blockscale_tile_config(
     ]
     if not valid:
         return (64, 128, 128)
-    wide_n = get_gfx().startswith("gfx942")
+    if get_gfx().startswith("gfx942") and m > _BLOCKSCALE_GFX942_DECODE_M:
+        t = _blockscale_tile_cfg_gfx942(
+            m, n, valid, _cu_count(torch.cuda.current_device())
+        )
+        if t is not None:
+            return t
 
     def _score(t):
         tm, tn, tk = t
@@ -514,10 +558,6 @@ def select_blockscale_tile_config(
             s += 6 if tn == 64 else (4 if tn == 128 else (2 if tn == 256 else 0))
         elif m <= 512:
             s += 8 if tn == 128 else (4 if tn == 64 else (4 if tn == 256 else 0))
-        elif wide_n:
-            # gfx942 measured faster with the wider tile once M is large; other
-            # arches keep FlyDSL's preference.
-            s += 8 if tn == 256 else (6 if tn == 128 else 2)
         else:
             s += 8 if tn == 128 else (4 if tn == 64 else (4 if tn == 256 else 0))
         s += 6 if tk == 128 else 3

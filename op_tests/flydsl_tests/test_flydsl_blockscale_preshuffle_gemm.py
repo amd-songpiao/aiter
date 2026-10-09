@@ -397,6 +397,31 @@ def test_tile_waves_heuristic(monkeypatch):
     assert gk.select_blockscale_tile_waves(32768, 4352, 5120)[3] == 4
 
 
+def test_gfx942_tile_heuristic(monkeypatch):
+    """The most efficient tile that still fills a 304-CU part; decode M keeps the
+    FlyDSL scoring."""
+    from aiter.ops.flydsl import gemm_kernels
+
+    monkeypatch.setattr(gemm_kernels, "get_gfx", lambda: "gfx942")
+    monkeypatch.setattr(gemm_kernels, "_cu_count", lambda _: 304)
+    select_blockscale_tile_config.cache_clear()
+    try:
+        # enough work for the widest tile
+        assert select_blockscale_tile_config(8192, 1024, 1024) == (64, 256, 128)
+        # 64 workgroups of 64x256 but 256 of 32x128: half a wave is enough there
+        assert select_blockscale_tile_config(1024, 1024, 8192) == (32, 128, 128)
+        # N=640 has no 256-wide tile; 64x128 is the first at half a wave
+        assert select_blockscale_tile_config(4096, 640, 4096) == (64, 128, 128)
+        # the old scoring gave this 64x256, i.e. 24 workgroups
+        assert select_blockscale_tile_config(768, 512, 8192) == (16, 64, 256)
+        # nothing fills the GPU and K rules out the 16-row tile: most workgroups
+        assert select_blockscale_tile_config(512, 768, 640) == (32, 64, 128)
+        # decode M
+        assert select_blockscale_tile_config(32, 7168, 4096) == (16, 64, 256)
+    finally:
+        select_blockscale_tile_config.cache_clear()
+
+
 def test_dispatch_matches_direct_call():
     """The same numbers must come out of gemm_a8w8_blockscale_bpreshuffle as out of
     the op called directly, i.e. the tuned-row plumbing (libtype, kernelName, the
