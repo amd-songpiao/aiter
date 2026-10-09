@@ -526,6 +526,21 @@ def select_blockscale_tile_config(
     return max(valid, key=_score)
 
 
+def default_use_cshuffle_epilog(m: int, n: int, k: int) -> bool:
+    """gfx950: stage the output through LDS for wide stores when the epilogue
+    dominates, i.e. short K with an output large against it.
+
+    Fitted on 14 shapes at K <= 768: on when K <= 512 and M*N >= 32768*K
+    (20480x7168x256 1.14x, 8192x4096x384 1.07x), off below that, where the
+    extra LDS round trip costs more than the wider stores save (8192x1024x512
+    0.97x, 128x7168x256 0.97x). Deeper K is neutral to a loss on every shape
+    measured. gfx942 is unmeasured and keeps the direct epilogue.
+    """
+    if not get_gfx().startswith("gfx95"):
+        return False
+    return k <= 512 and m * n >= 32768 * k
+
+
 @functools.lru_cache(maxsize=1024)
 def _compile_flydsl_blockscale(
     n: int,
@@ -583,7 +598,7 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
     tile_n: int = 0,
     tile_k: int = 0,
     scale_block_k: int = 128,
-    use_cshuffle_epilog: bool = False,
+    use_cshuffle_epilog: bool | None = None,
     dsrd_depth: int | None = None,
     use_async_copy: bool | None = None,
     num_waves: int = 4,
@@ -597,6 +612,9 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
     Reshuffling either per call would cost more than the kernel saves.
 
     Numerics are identical to gemm_a8w8_blockscale.
+
+    use_cshuffle_epilog and use_async_copy default (None) to a shape/arch choice;
+    see default_use_cshuffle_epilog and default_use_async_copy.
     """
     compile_fn = _get_blockscale_compile_fn()
     from aiter.utility import dtypes
@@ -628,6 +646,18 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
         use_async_copy = default_use_async_copy()
     if dsrd_depth is None:
         dsrd_depth = default_dsrd_depth()
+    if use_cshuffle_epilog is None:
+        use_cshuffle_epilog = default_use_cshuffle_epilog(m, n, k)
+        if (
+            use_cshuffle_epilog
+            and tile_m
+            and tile_n
+            and tile_k
+            and not _blockscale_tile_is_valid(
+                tile_m, tile_n, tile_k, n, k, scale_block_k, True, num_waves
+            )
+        ):
+            use_cshuffle_epilog = False
     if not (tile_m and tile_n and tile_k):
         tile_m, tile_n, tile_k = select_blockscale_tile_config(
             m,

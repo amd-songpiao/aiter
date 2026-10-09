@@ -1238,7 +1238,8 @@ def gemm_a8w8_blockscale_flydsl(
     tm = tn = tk = 0
     sbk = 128
     nw = 4
-    ac = cs = False
+    # None defers to the arch/shape defaults; only a tuned row pins them.
+    ac = cs = None
     if config is not None:
         ki = _parse_flydsl_blockscale_kernel_name(str(config.get("kernelName", "")))
         if ki is not None:
