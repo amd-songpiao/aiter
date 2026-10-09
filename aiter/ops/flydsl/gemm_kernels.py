@@ -891,7 +891,7 @@ def _blockscale_layout_wave_m_cfg(tile_m: int, tile_n: int) -> int:
     return 2 if (tile_m, tile_n) == _LAYOUT_TILE_LARGE else 1
 
 
-def _blockscale_layout_swizzle_cfg(tile_m: int, tile_n: int) -> bool:
+def _blockscale_layout_swizzle_cfg(tile_m: int, tile_n: int, k: int) -> bool:
     """Whether to remap workgroup ids for XCD L2 locality.
 
     On for every tile but 64x256. The map raises the measured L2 hit rate
@@ -902,28 +902,36 @@ def _blockscale_layout_swizzle_cfg(tile_m: int, tile_n: int) -> bool:
     looked like a loss at 128x128; it is not, and with waves_per_eu unset it
     actually allocates FEWER registers there, 240 against 248).
 
-    64x256 remains the exception: at 256 registers it is already on gfx942's
-    2-waves/SIMD cliff and the map's runtime div/mod pushes it over, a
-    reproducible 0.80x despite its hit rate improving 81.4 -> 88.4%.
+    At 64x256 it depends on K. That tile sits at 256 registers, on gfx942's
+    2-waves/SIMD cliff, and the map's index math costs it main-loop throughput,
+    which only shallow K can repay with the locality: at K=1024 it gains
+    (1024x8192x1024 1.16x, 8192x1024x1024 1.05x, 32768x1024x1024 1.03x), from
+    K=2304 up it loses (4096x7168x2304 0.91x, 4096x2304x7168 0.92x,
+    8192x1024x8192 0.97x). Measured on gfx942 only; gfx950 keeps it off at
+    64x256, as its tile rule was fitted.
     """
-    return (tile_m, tile_n) != _LAYOUT_TILE_DEEPK
+    if (tile_m, tile_n) == _LAYOUT_TILE_DEEPK:
+        return not _blockscale_layout_is_gfx950() and k <= _LAYOUT_WIDE_SWIZZLE_MAX_K
+    return True
 
 
 # Both carry the same 16384-element tile, so they cost the same LDS and do the
-# same work per workgroup; 128x128 is strictly the better shape of the two on
-# gfx942 (240 VGPR+AGPR and no spill, against 64x256's 256 and 12 bytes of
-# scratch) everywhere except deep K -- see _blockscale_layout_tile_cfg.
+# same work per workgroup. 128x128 has fewer registers (240 against 256), but
+# 64x256 is the faster of the two whenever N allows it -- see
+# _blockscale_layout_tile_cfg.
 _LAYOUT_TILE_LARGE = (128, 128)
 _LAYOUT_TILE_MID = (64, 128)
 _LAYOUT_TILE_SMALL = (32, 64)
 _LAYOUT_TILE_DEEPK = (64, 256)
-# K at which the main loop dominates enough that the wider N tile's extra reuse
-# beats 128x128's lower register pressure. Measured crossover: shapes at
-# K <= 4096 prefer 128x128, K >= 8192 prefer 64x256.
+# At deep K the main loop dominates enough that 64x256 is worth taking even
+# below one workgroup per CU...
 _LAYOUT_DEEPK_MIN_K = 8192
-# ...but only once 64x256 still makes enough workgroups to be worth it; below
+# ...but only once it still makes enough workgroups to be worth it; below
 # this the tile has to shrink regardless of K (deep_k, grid 64, wants 32x64).
 _LAYOUT_DEEPK_MIN_GRID = 128
+# Deepest K at which 64x256 still repays the XCD swizzle's index math; measured
+# a gain at 1024 and a loss from 2304 up -- see _blockscale_layout_swizzle_cfg.
+_LAYOUT_WIDE_SWIZZLE_MAX_K = 1024
 # Below this many 64x128 workgroups, halving tile_m to 32 buys more than the
 # reuse it gives up. Measured boundary is between 168 (32-high wins 1.17x) and
 # 256 (it loses 1.38x).
@@ -994,13 +1002,17 @@ def _blockscale_layout_tile_cfg(
     Four regimes, in priority order:
 
     Deep K with enough work: 64x256. The main loop dominates, so the wider N
-    tile's reuse outweighs its 12 bytes of spill (m8192_deepk 1.06x and
+    tile's reuse pays even below one workgroup per CU (m8192_deepk 1.06x and
     1024x4096x8192 1.10x over 128x128).
 
-    Enough work for 128x128: take it. Same 16384-element tile as 64x256 but a
-    better shape on gfx942 -- 240 VGPR+AGPR and no spill against 256 and 12
-    bytes of scratch (m8192 1.03x, m32768 1.21x, prefill_m2048 1.05x over the
-    old fixed 64x256).
+    Enough work to fill the GPU with a 16384-element tile: 64x256 if N allows
+    it, else 128x128. 64x256 measured 1.10-1.11x over 128x128 at
+    8192x1024x1024, 32768x1024x1024, 2048x4096x4096, 4096x7168x2304 and
+    4096x2304x7168, and 1.08x at 1024x8192x1024 once it keeps the XCD swizzle
+    there (see _blockscale_layout_swizzle_cfg). An earlier sweep had 128x128
+    ahead; it timed 20-call blocks, short enough that each one still ran at
+    the clock its predecessor's power draw left behind. These figures use
+    200-call blocks, scoring only their second half.
 
     Too little work even for 64x128: 32x64, which trades reuse for roughly
     twice the workgroups (1.13-1.59x over 64x128 across 15 such shapes).
@@ -1008,10 +1020,9 @@ def _blockscale_layout_tile_cfg(
     Otherwise 64x128, which was within 8% of the best candidate everywhere in
     that middle band while no other single tile was.
 
-    Known costs of keeping this to four rules: wide-N shapes at K <= 4096 and
-    one workgroup per CU would rather have 64x256 and lose ~3% (wide_n,
-    6144x1536x4096), and shapes whose M is an exact multiple of 64 just above
-    the shrink boundary lose ~12% to the 32-high tile (320x2048x2048).
+    Known cost of keeping this to four rules: shapes whose M is an exact
+    multiple of 64 just above the shrink boundary lose ~12% to the 32-high
+    tile (320x2048x2048).
     """
     cu = _cu_count(device.index or 0)
     if _blockscale_layout_is_gfx950():
@@ -1020,9 +1031,11 @@ def _blockscale_layout_tile_cfg(
     if k >= _LAYOUT_DEEPK_MIN_K and n % tn == 0:
         if ((m + tm - 1) // tm) * (n // tn) >= _LAYOUT_DEEPK_MIN_GRID:
             return tm, tn
-    tm, tn = _LAYOUT_TILE_LARGE
-    if n % tn == 0 and ((m + tm - 1) // tm) * (n // tn) >= cu:
-        return tm, tn
+    if ((m + 127) // 128) * (n // 128) >= cu:
+        if n % 256 == 0:
+            return _LAYOUT_TILE_DEEPK
+        if n % 128 == 0:
+            return _LAYOUT_TILE_LARGE
     tm, tn = _LAYOUT_TILE_MID
     if n % tn:
         return tm, 64
@@ -1096,7 +1109,7 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle_layout(
     # CShuffle aliases the A ring for its staging and has no split_k path.
     if split_k > 1:
         heur_cs = False
-    heur_swz = _blockscale_layout_swizzle_cfg(tile_m, tile_n)
+    heur_swz = _blockscale_layout_swizzle_cfg(tile_m, tile_n, k)
     heur_wm = _blockscale_layout_wave_m_cfg(tile_m, tile_n)
     scale_cfg = _blockscale_layout_scale_cfg(tile_m, tile_n)
     heur_depth = scale_cfg.pop("a_prefetch_depth", heur_depth)

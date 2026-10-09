@@ -55,7 +55,8 @@ Design notes (status as of this file's first working version):
   useful (and not necessary) for already grid-saturated shapes.
 - No bias/activation epilogue. preshuffle_gemm.py has those and they port over
   mechanically. Its XCD swizzle is implemented here too (use_xcd_swizzle) and
-  is enabled by the caller-side heuristic for every tile but 64x256.
+  is enabled by the caller-side heuristic for every tile but 64x256, where
+  only shallow K takes it.
 """
 
 import functools
@@ -206,9 +207,9 @@ def compile_blockscale_preshuffle_gemm_layout(
     4x, worth up to 2.5x where the starting locality was poor.
 
     Default off HERE because this entry point takes the tile as given. The
-    index math costs ~32 registers, which only the small tiles can absorb
-    without falling off gfx942's 256-register 2-waves/SIMD cliff, so the
-    caller-side heuristic enables it for those alone -- see
+    index math costs registers, which 64x256 -- already at gfx942's
+    256-register 2-waves/SIMD cliff -- only repays at shallow K, so the
+    caller-side heuristic decides by tile and K -- see
     gemm_kernels._blockscale_layout_swizzle_cfg.
 
     use_mfma_scale_128 (default: on for gfx95x) issues CDNA4's

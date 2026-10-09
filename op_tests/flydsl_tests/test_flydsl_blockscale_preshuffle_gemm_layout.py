@@ -240,11 +240,11 @@ def test_occupancy_knobs_are_numerically_neutral():
 
 
 def test_tile_and_swizzle_heuristics(monkeypatch):
-    """Tile comes from grid size and K; the XCD swizzle follows the tile.
+    """Tile comes from grid size and K; the XCD swizzle follows tile and K.
 
     The swizzle lifts the L2 hit rate on every shape measured, but 64x256 is
-    the one candidate at 256 VGPR+AGPR and cannot afford its index math, so it
-    is the sole opt-out."""
+    the one candidate at 256 VGPR+AGPR and only repays its index math at
+    shallow K."""
     import torch as _torch
 
     from aiter.ops.flydsl import gemm_kernels
@@ -260,16 +260,19 @@ def test_tile_and_swizzle_heuristics(monkeypatch):
 
     # Deep K with enough workgroups takes the wide tile; shallow K does not.
     assert _blockscale_layout_tile_cfg(8192, 1024, 8192, dev) == (64, 256)
-    assert _blockscale_layout_tile_cfg(8192, 1024, 1024, dev) == (128, 128)
+    # A GPU-filling grid takes 64x256 when N allows it, 128x128 otherwise.
+    assert _blockscale_layout_tile_cfg(8192, 1024, 1024, dev) == (64, 256)
+    assert _blockscale_layout_tile_cfg(8192, 1152, 1024, dev) == (128, 128)
     # Grid-starved shapes shrink rather than leave CUs idle.
     assert _blockscale_layout_tile_cfg(128, 4096, 4096, dev) == (32, 64)
     # N that is not a multiple of 128 still yields a legal tile_n.
     tm, tn = _blockscale_layout_tile_cfg(1024, 1024 + 64, 1024, dev)
     assert (1024 + 64) % tn == 0, (tm, tn)
 
-    assert _blockscale_layout_swizzle_cfg(64, 256) is False
+    assert _blockscale_layout_swizzle_cfg(64, 256, 1024) is True
+    assert _blockscale_layout_swizzle_cfg(64, 256, 2304) is False
     for tile in ((128, 128), (64, 128), (32, 64)):
-        assert _blockscale_layout_swizzle_cfg(*tile) is True, tile
+        assert _blockscale_layout_swizzle_cfg(*tile, 4096) is True, tile
 
     # Only the 128-row tile has both the LDS traffic to save and the registers
     # to pay for it.
@@ -302,6 +305,7 @@ def test_gfx950_tile_and_scale_heuristics(monkeypatch):
     assert (1024 + 64) % tn == 0, (tm, tn)
 
     monkeypatch.setattr(gemm_kernels, "_blockscale_layout_is_gfx950", lambda: True)
+    assert gemm_kernels._blockscale_layout_swizzle_cfg(64, 256, 1024) is False
     assert _blockscale_layout_scale_cfg(32, 64) == {}
     assert _blockscale_layout_scale_cfg(64, 128) == {
         "stage_a_scales": True,
