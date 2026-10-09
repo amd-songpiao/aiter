@@ -596,7 +596,7 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
     Numerics are identical to gemm_a8w8_blockscale.
     """
     compile_fn = _get_blockscale_compile_fn()
-    dtypes = _get_dtypes()
+    from aiter.utility import dtypes
 
     m, k = XQ.shape[0], XQ.shape[-1]
     n = WQ.shape[0] if WQ.dim() > 1 else w_scale.shape[0] * 128
@@ -683,6 +683,333 @@ def flydsl_gemm_a8w8_blockscale_bpreshuffle(
     _run_compiled(
         exe,
         out_contig,
+        XQ.contiguous(),
+        WQ.contiguous(),
+        x_scale_flat,
+        w_scale.contiguous().view(-1),
+        m,
+        n,
+        fx.Stream(torch.cuda.current_stream()),
+    )
+    if out_contig is not out:
+        out.copy_(out_contig)
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# FlyDSL blockscale bpreshuffle GEMM, layout-API kernel (gemm_blockscale_
+# preshuffle_layout.py). A separate, from-scratch kernel on FlyDSL's
+# layout-algebra API (TiledMma/TiledCopy/fx.gemm), not another hand-rolled-
+# addressing variant -- see that file's module docstring. gfx942/gfx950 only,
+# distinct from the gfx1250 MXFP8 family above. Not wired into the tuned-CSV
+# auto-dispatch in gemm_op_a8w8.py yet (deliberately: no tuner/AOT support
+# until this kernel has matched tests passing -- call it directly via
+# gemm_a8w8_blockscale_bpreshuffle_layout in gemm_op_a8w8.py in the meantime).
+# ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=1)
+def _get_blockscale_layout_compile_fn():
+    """Import the layout-API block-scale compiler on first use."""
+    from .kernels import gemm_blockscale_preshuffle_layout as _bsl
+
+    logger.info("[FlyDSL] loaded blockscale bpreshuffle GEMM (layout API) compiler")
+    return _bsl.compile_blockscale_preshuffle_gemm_layout
+
+
+# split_k is for the grid-starved small-M shapes this kernel's fixed 64x256
+# tile under-fills 304 CUs on (see repo memory); the bounds below are sized
+# for that regime, not for huge, already grid-saturated M.
+BLOCKSCALE_SPLIT_K_MAX_TILES = 4096
+BLOCKSCALE_SPLIT_K_WORKSPACE_ELEMS = 64 * 1024 * 1024  # fp32 elements (256 MiB)
+
+
+@functools.lru_cache(maxsize=128)
+def _get_blockscale_split_buffers(
+    device: torch.device,
+    stream: torch.cuda.Stream,
+) -> tuple[Tensor, Tensor]:
+    # Safe to reuse across calls: launches on a stream are ordered and the
+    # reduction hands the semaphore back zeroed (see splitk_epilogue.py).
+    with persistent_alloc(device):
+        workspace = torch.empty(
+            BLOCKSCALE_SPLIT_K_WORKSPACE_ELEMS, dtype=torch.float32, device=device
+        )
+        semaphore = torch.zeros(
+            BLOCKSCALE_SPLIT_K_MAX_TILES, dtype=torch.int32, device=device
+        )
+    return workspace, semaphore
+
+
+def _check_blockscale_split_capacity(
+    m: int, n: int, tile_m: int, tile_n: int, split_k: int
+) -> None:
+    tiles = ((m + tile_m - 1) // tile_m) * ((n + tile_n - 1) // tile_n)
+    if tiles > BLOCKSCALE_SPLIT_K_MAX_TILES:
+        raise RuntimeError(
+            f"[FlyDSL] split_k needs {tiles} tile semaphores, "
+            f"more than {BLOCKSCALE_SPLIT_K_MAX_TILES}"
+        )
+    elems = split_k * m * n
+    if elems > BLOCKSCALE_SPLIT_K_WORKSPACE_ELEMS:
+        raise RuntimeError(
+            f"[FlyDSL] split_k needs a {elems}-element fp32 workspace, "
+            f"more than {BLOCKSCALE_SPLIT_K_WORKSPACE_ELEMS}"
+        )
+
+
+@functools.lru_cache(maxsize=8)
+def _cu_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _blockscale_layout_occupancy_cfg(
+    tile_m: int, tile_n: int
+) -> tuple[int | None, int, bool]:
+    """Pick (waves_per_eu, a_prefetch_depth, use_cshuffle_epilog) from the tile.
+
+    Keyed on the tile rather than the grid: the tile sets the register count,
+    and every one of these knobs is really a register trade. (An earlier
+    grid > CU rule was fitted when the kernel only ever ran 64x256 at 272
+    registers; it mis-serves the 64-register tiles the tile heuristic now
+    picks, costing 1.10x on deep_k alone.)
+
+    waves_per_eu=2 is only worth forcing at 64x256, the one tile sitting on
+    gfx942's 256-register 2-waves/SIMD cliff -- 177.5us against 206.6us there.
+    Everywhere else the compiler already reaches that occupancy and forcing it
+    is within noise (<=1%).
+
+    a_prefetch_depth=2 needs ~16 spare registers to double-buffer the A staging
+    fragment, which only the 32-high tile (64 registers) has; it pays there and
+    costs 10-20% at 128x128, which has none.
+
+    CShuffle is on for every tile. Its coalesced stores beat the MFMA-native
+    layout in all but one measured cell, including the small grids an earlier
+    grid > CU gate excluded (smallm256 1.06x).
+    """
+    if tile_m == 32:
+        return 2, 2, True
+    if (tile_m, tile_n) == _LAYOUT_TILE_DEEPK:
+        return 2, 1, True
+    return None, 1, True
+
+
+def _blockscale_layout_wave_m_cfg(tile_m: int, tile_n: int) -> int:
+    """How many of the 4 waves split M rather than N.
+
+    Splitting waves across N only means every wave ds_reads all of A's
+    m-fragments per k-step, so a 128-row tile issues twice the LDS traffic of a
+    64-row one for the same MFMA count -- measured 2.50x SQ_LDS_IDX_ACTIVE and
+    2.27x SQ_WAIT_INST_LDS against the hand-rolled kernel at 128x128, with
+    MFMA counts identical and VMEM lower. Giving M two waves halves it.
+
+    It is not free: each wave then covers twice the N columns, so its B
+    fragment doubles (232 -> 256 registers at 128x128). That is affordable at
+    128x128 and pays (m32768 1.07x, prefill 1.06x), break-even on the small
+    tiles, and catastrophic at 64x256, which is already at 256 registers and
+    spills 344 bytes for a 0.18x collapse.
+    """
+    return 2 if (tile_m, tile_n) == _LAYOUT_TILE_LARGE else 1
+
+
+def _blockscale_layout_swizzle_cfg(tile_m: int, tile_n: int) -> bool:
+    """Whether to remap workgroup ids for XCD L2 locality.
+
+    On for every tile but 64x256. The map raises the measured L2 hit rate
+    (TCC_HIT/(TCC_HIT+TCC_MISS)) everywhere it was tried -- 35.2 -> 79.3% at
+    128x4096x4096, 50.7 -> 80.5% at 1024x8192x1024, 72.6 -> 81.4% at
+    2048x4096x4096 -- cutting DRAM reads up to 4x, worth 1.03-1.26x once the
+    occupancy knobs stopped forcing waves_per_eu=2 (under that forcing it
+    looked like a loss at 128x128; it is not, and with waves_per_eu unset it
+    actually allocates FEWER registers there, 240 against 248).
+
+    64x256 remains the exception: at 256 registers it is already on gfx942's
+    2-waves/SIMD cliff and the map's runtime div/mod pushes it over, a
+    reproducible 0.80x despite its hit rate improving 81.4 -> 88.4%.
+    """
+    return (tile_m, tile_n) != _LAYOUT_TILE_DEEPK
+
+
+# Both carry the same 16384-element tile, so they cost the same LDS and do the
+# same work per workgroup; 128x128 is strictly the better shape of the two on
+# gfx942 (240 VGPR+AGPR and no spill, against 64x256's 256 and 12 bytes of
+# scratch) everywhere except deep K -- see _blockscale_layout_tile_cfg.
+_LAYOUT_TILE_LARGE = (128, 128)
+_LAYOUT_TILE_MID = (64, 128)
+_LAYOUT_TILE_SMALL = (32, 64)
+_LAYOUT_TILE_DEEPK = (64, 256)
+# K at which the main loop dominates enough that the wider N tile's extra reuse
+# beats 128x128's lower register pressure. Measured crossover: shapes at
+# K <= 4096 prefer 128x128, K >= 8192 prefer 64x256.
+_LAYOUT_DEEPK_MIN_K = 8192
+# ...but only once 64x256 still makes enough workgroups to be worth it; below
+# this the tile has to shrink regardless of K (deep_k, grid 64, wants 32x64).
+_LAYOUT_DEEPK_MIN_GRID = 128
+# Below this many 64x128 workgroups, halving tile_m to 32 buys more than the
+# reuse it gives up. Measured boundary is between 168 (32-high wins 1.17x) and
+# 256 (it loses 1.38x).
+_LAYOUT_SHRINK_MAX_GRID = 192
+
+
+def _blockscale_layout_tile_cfg(
+    m: int, n: int, k: int, device: torch.device
+) -> tuple[int, int]:
+    """Pick (tile_m, tile_n) from the grid each candidate yields, plus K.
+
+    Measured over a tile_m x tile_n sweep ({32,64,128} x {64,128,256}) on nine
+    shapes and validated on three further disjoint sets (8 shapes each); the
+    aggregate landed within 2.4% of the per-shape oracle. tile_m=16 and
+    tile_k=256, which the hand-rolled kernel also tunes over, are not
+    expressible here: 16 rows do not give every thread a whole 16-byte A load,
+    and tile_k is pinned to scale_block_k by the block-scale accumulation.
+
+    Four regimes, in priority order:
+
+    Deep K with enough work: 64x256. The main loop dominates, so the wider N
+    tile's reuse outweighs its 12 bytes of spill (m8192_deepk 1.06x and
+    1024x4096x8192 1.10x over 128x128).
+
+    Enough work for 128x128: take it. Same 16384-element tile as 64x256 but a
+    better shape on gfx942 -- 240 VGPR+AGPR and no spill against 256 and 12
+    bytes of scratch (m8192 1.03x, m32768 1.21x, prefill_m2048 1.05x over the
+    old fixed 64x256).
+
+    Too little work even for 64x128: 32x64, which trades reuse for roughly
+    twice the workgroups (1.13-1.59x over 64x128 across 15 such shapes).
+
+    Otherwise 64x128, which was within 8% of the best candidate everywhere in
+    that middle band while no other single tile was.
+
+    Known costs of keeping this to four rules: wide-N shapes at K <= 4096 and
+    one workgroup per CU would rather have 64x256 and lose ~3% (wide_n,
+    6144x1536x4096), and shapes whose M is an exact multiple of 64 just above
+    the shrink boundary lose ~12% to the 32-high tile (320x2048x2048).
+    """
+    cu = _cu_count(device.index or 0)
+    tm, tn = _LAYOUT_TILE_DEEPK
+    if k >= _LAYOUT_DEEPK_MIN_K and n % tn == 0:
+        if ((m + tm - 1) // tm) * (n // tn) >= _LAYOUT_DEEPK_MIN_GRID:
+            return tm, tn
+    tm, tn = _LAYOUT_TILE_LARGE
+    if n % tn == 0 and ((m + tm - 1) // tm) * (n // tn) >= cu:
+        return tm, tn
+    tm, tn = _LAYOUT_TILE_MID
+    if n % tn:
+        return tm, 64
+    if ((m + tm - 1) // tm) * (n // tn) < _LAYOUT_SHRINK_MAX_GRID:
+        return _LAYOUT_TILE_SMALL
+    return tm, tn
+
+
+def flydsl_gemm_a8w8_blockscale_bpreshuffle_layout(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    tile_m: int = 0,
+    tile_n: int = 0,
+    tile_k: int = 128,
+    scale_block_k: int = 128,
+    num_waves: int = 4,
+    split_k: int = 1,
+    waves_per_eu: int | None = -1,
+    a_prefetch_depth: int = -1,
+    use_cshuffle_epilog: int = -1,
+    use_xcd_swizzle: int = -1,
+    wave_m: int = -1,
+) -> Tensor:
+    """Compile (cached) and run the FlyDSL blockscale bpreshuffle GEMM, layout-API
+    variant. Same calling convention, layouts, and numerics as
+    flydsl_gemm_a8w8_blockscale_bpreshuffle (WQ preshuffled with
+    shuffle_weight(w, layout=(16, 16)), x_scale K-major) -- this is a different
+    kernel implementation, not a different op contract.
+
+    tile_k must equal scale_block_k (128): see gemm_blockscale_preshuffle_layout.py's
+    module docstring for why. split_k > 1 reduces fp32 partials in-kernel -- see
+    that file's module docstring and splitk_epilogue.py; use it for grid-starved
+    small-M shapes, not large/already grid-saturated ones.
+
+    waves_per_eu and a_prefetch_depth default to a joint shape-driven heuristic
+    (see _blockscale_layout_occupancy_cfg); pass explicit values to override.
+    tile_m/tile_n default to 0, meaning pick by shape (see
+    _blockscale_layout_tile_cfg); pass both to override. use_xcd_swizzle
+    likewise defaults to a tile-driven choice (see
+    _blockscale_layout_swizzle_cfg).
+    """
+    compile_fn = _get_blockscale_layout_compile_fn()
+    from aiter.utility import dtypes
+
+    m, k = XQ.shape[0], XQ.shape[-1]
+    n = WQ.shape[0] if WQ.dim() > 1 else w_scale.shape[0] * 128
+
+    if XQ.dtype == torch.uint8:
+        XQ = XQ.view(dtypes.fp8)
+    if WQ.dtype == torch.uint8:
+        WQ = WQ.view(dtypes.fp8)
+    if XQ.dtype != dtypes.fp8:
+        raise RuntimeError(f"[FlyDSL] blockscale GEMM needs fp8 input, got {XQ.dtype}")
+    if out.dtype == torch.bfloat16:
+        out_dtype = "bf16"
+    elif out.dtype == torch.float16:
+        out_dtype = "fp16"
+    else:
+        raise RuntimeError(
+            f"[FlyDSL] unsupported output dtype {out.dtype}; "
+            f"expected torch.bfloat16 or torch.float16"
+        )
+
+    if not (tile_m and tile_n):
+        tile_m, tile_n = _blockscale_layout_tile_cfg(m, n, k, out.device)
+    heur_wpe, heur_depth, heur_cs = _blockscale_layout_occupancy_cfg(tile_m, tile_n)
+    # CShuffle aliases the A ring for its staging and has no split_k path.
+    if split_k > 1:
+        heur_cs = False
+    heur_swz = _blockscale_layout_swizzle_cfg(tile_m, tile_n)
+    heur_wm = _blockscale_layout_wave_m_cfg(tile_m, tile_n)
+    exe = compile_fn(
+        N=n,
+        K=k,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        scale_block_k=scale_block_k,
+        out_dtype=out_dtype,
+        num_waves=num_waves,
+        split_k=split_k,
+        waves_per_eu=heur_wpe if waves_per_eu == -1 else waves_per_eu,
+        a_prefetch_depth=heur_depth if a_prefetch_depth == -1 else a_prefetch_depth,
+        use_cshuffle_epilog=(
+            heur_cs if use_cshuffle_epilog == -1 else bool(use_cshuffle_epilog)
+        ),
+        use_xcd_swizzle=(
+            heur_swz if use_xcd_swizzle == -1 else bool(use_xcd_swizzle)
+        ),
+        wave_m=heur_wm if wave_m == -1 else wave_m,
+    )
+
+    if x_scale.dim() == 2 and x_scale.stride(0) == 1 and x_scale.size(1) > 1:
+        x_scale_flat = x_scale.t().contiguous().view(-1)
+    else:
+        x_scale_flat = x_scale.contiguous().view(-1)
+
+    out_contig = out if out.is_contiguous() else out.contiguous()
+    if split_k > 1:
+        _check_blockscale_split_capacity(m, n, tile_m, tile_n, split_k)
+        workspace, semaphore = _get_blockscale_split_buffers(
+            out.device, torch.cuda.current_stream(device=out.device)
+        )
+    else:
+        workspace = out_contig
+        # dtype is part of the executable's cache signature, so this must match
+        # what a split_k>1 compile passes or the split_k=1 kernel misses it.
+        semaphore = torch.empty(0, dtype=torch.int32, device=out.device)
+    _run_compiled(
+        exe,
+        workspace.view(-1),
+        out_contig,
+        semaphore,
         XQ.contiguous(),
         WQ.contiguous(),
         x_scale_flat,

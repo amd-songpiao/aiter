@@ -1262,6 +1262,64 @@ def gemm_a8w8_blockscale_flydsl(
     )
 
 
+def gemm_a8w8_blockscale_bpreshuffle_layout(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    tile_m: int = 0,
+    tile_n: int = 0,
+    tile_k: int = 128,
+    num_waves: int = 4,
+    split_k: int = 1,
+    waves_per_eu: int | None = -1,
+    a_prefetch_depth: int = -1,
+    use_cshuffle_epilog: int = -1,
+    use_xcd_swizzle: int = -1,
+    wave_m: int = -1,
+) -> Tensor:
+    """FlyDSL blockscale bpreshuffle GEMM, layout-API kernel (gemm_blockscale_
+    preshuffle_layout.py -- TiledMma/TiledCopy/fx.gemm, not the hand-rolled-
+    addressing kernel gemm_a8w8_blockscale_flydsl above calls).
+
+    Same contract as gemm_a8w8_blockscale_flydsl (WQ preshuffled with
+    shuffle_weight(w, layout=(16, 16)), x_scale K-major); gfx942/gfx950 only.
+    Not wired into gemm_a8w8_blockscale_bpreshuffle's tuned-CSV auto-dispatch
+    yet -- call this directly until that kernel has a tuner/AOT entry.
+
+    split_k > 1 is for grid-starved small-M shapes (too few workgroups to
+    fill the GPU at the selected tile) -- not useful for large/already
+    grid-saturated M. tile_m/tile_n default to 0, meaning pick by shape;
+    waves_per_eu and a_prefetch_depth default to a joint shape-driven
+    occupancy/latency heuristic. Pass explicit values to override.
+    """
+    if not _flydsl_blockscale_supported():
+        raise RuntimeError(
+            f"gemm_a8w8_blockscale_bpreshuffle_layout needs gfx942/gfx950, "
+            f"got {get_gfx()}"
+        )
+    from .flydsl.gemm_kernels import flydsl_gemm_a8w8_blockscale_bpreshuffle_layout
+
+    return flydsl_gemm_a8w8_blockscale_bpreshuffle_layout(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        out,
+        tile_m,
+        tile_n,
+        tile_k,
+        num_waves=num_waves,
+        split_k=split_k,
+        waves_per_eu=waves_per_eu,
+        a_prefetch_depth=a_prefetch_depth,
+        use_cshuffle_epilog=use_cshuffle_epilog,
+        use_xcd_swizzle=use_xcd_swizzle,
+        wave_m=wave_m,
+    )
+
+
 @torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
 def gemm_a8w8_blockscale_bpreshuffle(
     XQ: Tensor,
